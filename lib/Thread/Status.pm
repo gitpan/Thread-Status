@@ -7,12 +7,12 @@ use Thread::Signal ();
 # Make sure we have version info for this module
 # Make sure we do everything by the book from now on
 
-our $VERSION = '0.02';
+$VERSION = '0.03';
 use strict;
 
 # Make sure we only load stuff when we actually need it
 
-use AutoLoader 'AUTOLOAD';
+use load;
 
 # Remember the base thread id (only one allowed to make changes and start)
 # Initialize the thread id of the monitoring thread
@@ -151,7 +151,7 @@ sub _sweep {
 
 #---------------------------------------------------------------------------
 
-# AutoLoader takes over from here
+# The following subroutines are loaded on demand only
 
 __END__
 
@@ -663,6 +663,8 @@ EOD
 } #_handle
 
 #---------------------------------------------------------------------------
+
+__END__
 
 =head1 NAME
 
