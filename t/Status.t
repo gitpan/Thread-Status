@@ -7,8 +7,9 @@ BEGIN {				# Magic Perl CORE pragma
 
 use Test::More tests => 10;
 use strict;
+use warnings;
 
-use Thread::Status ();
+use Thread::Status (); # cannot do a use_ok because we don't want to import
 ok( defined( $Thread::Status::VERSION ),	'check whether loaded' );
 can_ok( 'Thread::Status',qw(
  callers

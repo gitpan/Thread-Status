@@ -7,7 +7,7 @@ use Thread::Signal ();
 # Make sure we have version info for this module
 # Make sure we do everything by the book from now on
 
-$VERSION = '0.03';
+$VERSION = '0.04';
 use strict;
 
 # Make sure we only load stuff when we actually need it
@@ -930,7 +930,7 @@ performs the status monitoring.
 
 =head1 OPTIMIZATIONS
 
-This module uses L<AutoLoader> to reduce memory and CPU usage. This causes
+This module uses L<load> to reduce memory and CPU usage. This causes
 subroutines only to be compiled in a thread when they are actually needed at
 the expense of more CPU when they need to be compiled.  Simple benchmarks
 however revealed that the overhead of the compiling single routines is not
@@ -951,7 +951,7 @@ Please report bugs to <perlbugs@dijkmat.nl>.
 
 =head1 COPYRIGHT
 
-Copyright (c) 2002 Elizabeth Mattijsen <liz@dijkmat.nl>. All rights
+Copyright (c) 2002-2003 Elizabeth Mattijsen <liz@dijkmat.nl>. All rights
 reserved.  This program is free software; you can redistribute it and/or
 modify it under the same terms as Perl itself.
 
