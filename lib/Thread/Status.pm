@@ -7,7 +7,7 @@ use Thread::Signal ();
 # Make sure we have version info for this module
 # Make sure we do everything by the book from now on
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 use strict;
 
 # Make sure we only load stuff when we actually need it
@@ -22,7 +22,7 @@ our $base_tid = threads->tid;
 our $monitor_tid : shared;
 our $monitor_pid : shared;
 
-# Initialize the number of seconds between each status report
+# Initialize the number of seconds between every status report
 # Initialize the format
 # Initialize XML encoding
 # Initialize the output direction
@@ -30,7 +30,7 @@ our $monitor_pid : shared;
 # Initialize the number of callers
 # Initialize the shorten flag
 
-our $each : shared = 5;
+our $every : shared = 5;
 our $format : shared = 'plain';
 our $output : shared = 'STDERR';
 our $encoding : shared = 'iso-latin-1';
@@ -53,10 +53,8 @@ our %info : shared;    # must all be our because of AutoLoader usage
 our $dump : shared = 0;
 
 # Initialize the thread local thread id (so we don't need threads->tid always)
-# Initialize the thread local old threads::shared::cond_wait code ref
 
 our $tid;
-our $cond_wait;
 
 # Create match string for paths
 # Make sure periods are really periods during matching
@@ -72,6 +70,93 @@ $paths = qr#^(?:$paths)#;
 
 #---------------------------------------------------------------------------
 
+# internal subroutines
+
+#---------------------------------------------------------------------------
+
+sub _sweep {
+
+# Return now if switched off
+# If we're called to wake up from the main monitoring loop
+#  Reset the wakup flag
+#  And exit the main processing loop in the monitoring thread
+
+    return unless $running;
+    if ($wakeup and threads->tid == $monitor_tid) {
+        $wakeup = 0;
+        die;
+    }
+
+# Attempt to get the lock
+# If another thread is already sweeping
+#  Remember where we are
+#  Increment counter for number of threads swept
+#  Signal the main thread that we're done here
+#  And return (this thread is done and should allow other threads now)
+# Indicate we're sweeping
+# Reset the number of threads swept
+
+    {lock( $sweeping );
+     if ($sweeping) {
+         _remember( 2 );
+         $swept++;
+         {no warnings 'threads'; threads::shared::cond_signal( $swept )};
+	 return;
+     }
+     $sweeping = 1;
+     $swept = 0
+    } #$sweeping
+
+# Initialize local copy of info hash
+# Initialize number of threads swept (already stored info)
+# Make sure we're the only one collecting
+# Signal all of the other threads and remember how many were signalled
+# Wait for all to have reported in
+
+    my %stuff;
+    {lock( $swept );
+     my %waiting = %info;
+     $swept = keys %waiting;
+     my $tids = Thread::Signal->signal( $signal,-2 );
+     threads::shared::cond_wait( $swept ) until $swept == $tids;
+
+# Create local copy of the shared hash with info
+# Reset the shared hash (we don't want to have any info oozing through)
+# Mark that we're done sweeping
+
+     %stuff = %info;
+     %info = %waiting;
+     $sweeping = 0;
+    } #$swept
+
+# If a specific dump is requested
+#  Make sure we're the only ones now
+#  Freeze our stuff in the dump area
+#  And signal that we're ready
+# Else (just need to report)
+#  Perform basic, normal reporting
+
+    if ($dump == 1) {
+        lock( $dump );
+        $dump = join( "\0",map {"$_\n$stuff{$_}"} keys %stuff );
+        threads::shared::cond_signal( $dump );
+    } else {
+        _report( \%stuff );
+    }
+
+# Exit now if the signal used indicates we need to quit
+
+    exit() if $signal eq 'INT';
+} #_sweep
+
+#---------------------------------------------------------------------------
+
+# AutoLoader takes over from here
+
+__END__
+
+#---------------------------------------------------------------------------
+
 # class methods
 
 #---------------------------------------------------------------------------
@@ -79,7 +164,7 @@ $paths = qr#^(?:$paths)#;
 #      2 new number of seconds between updates
 # OUT: 1 current number of seconds between updates
 
-sub each {
+sub every {
 
 # If we have a new time specification
 #  Die now if we're not in the base thread
@@ -92,14 +177,14 @@ sub each {
     if (@_ > 1) {
         die "Can only set time specification from the base thread\n"
          if threads->tid != $base_tid;
-        $each = $_[1];
+        $every = $_[1];
         if ($running) {
             $wakeup = 1;
             kill $signal,$monitor_pid;
         }
     }
-    $each;
-} #each
+    $every;
+} #every
 
 #---------------------------------------------------------------------------
 #  IN: 1 class (ignored)
@@ -216,7 +301,7 @@ sub signal {
 
 #---------------------------------------------------------------------------
 #  IN: 1 class (ignored)
-#      2 flag: whether to let the world know the process ID
+#      2 flag: whether to let the world know the process ID (internal only)
 
 sub start {
 
@@ -235,65 +320,37 @@ sub start {
     Thread::Signal->register( $signal => \&_sweep );
     Thread::Signal->automatic( $signal );
 
-# If we didn't hijack threads::shared::cond_wait yet
-#  Remember the original code ref of cond_wait
-#  Hijack cond_wait with a sub
-#   Remember where we're called if we're monitoring
-#   Perform the original cond_wait
-#   Return now if we're not running
-#   Unremember where we are
-
-    unless ($cond_wait) {
-        $cond_wait = \&threads::shared::cond_wait;
-        no strict 'refs';
-        *threads::shared::cond_wait = sub (\[$@%]) {
-            _remember( 1 ) if $running;
-            $cond_wait->( @_ );
-            return unless $running;
-
-#   Unremember where we are
-#   Allows us to signal unlocked variables
-#   Send a signal to sweeper in case it's still waiting
-
-            delete( $info{$tid} ); # _remember sets $tid
-            no warnings 'threads';
-            threads::shared::cond_signal( $swept );
-        }
-    }
-
 # Indicate we're running
+# Reset monitor pid
 # Create a new thread and save its thread id
-#  Restore the original cond_wait in this thread
 #  While monitoring is active (allows stopping, or resetting automatic time)
 #   Make sure we eval, so that we can die out of this loop
 #    Loop forever (dieing is the only way out)
 #     Sleep for the amount that we need to do until the next dump
 #     Do a dump if we're actually monitoring automatically
-#   Reset monitor tid and pid
-# Set the process id of the monitoring thread
+# Wait until the process id of the monitoring thread is set
 
     $running = 1;
+    $monitor_pid = 0;
     $monitor_tid = threads->new( sub {
-	{no strict 'refs'; *threads::shared::cond_wait = $cond_wait};
         while ($running) {
             eval {
                 while (1) {
-                    sleep( $each || 3600 );
-                    _sweep() if $each;
+                    sleep( $every || 3600 );
+                    _sweep() if $every;
                 }
             }
         }
-        $monitor_tid = $monitor_pid = 0;
     } )->tid;
-    sleep( 1 ) until $monitor_pid = $Thread::Signal::pid{$monitor_tid};
+    threads->yield until $monitor_pid = $Thread::Signal::pid{$monitor_tid};
 
 # If we're to show how
 #  Obtain the pid of the monitoring thread
 #  Show what we need to do to get a status report
 
     if ($_[1]) {
-        warn $each ? <<EOD1 : <<EOD2;
-Thread::Status: $format report every $each seconds to "$output"
+        warn $every ? <<EOD1 : <<EOD2;
+Thread::Status: $format report every $every seconds to "$output"
 EOD1
 Thread::Status: 'kill -$signal $monitor_pid' for $format report to "$output"
 EOD2
@@ -390,108 +447,38 @@ sub monitor_pid { $monitor_pid } #monitor_pid
 # standard Perl features
 
 #---------------------------------------------------------------------------
-#  IN: 1 class (ignored)
+#  IN: 1 class
 #      2..N parameter hash
 
 sub import {
+
+# Obtain the class
+# Die now if number of parameters incorrect
+
+    my $class = shift;
+    die qq(Thread::Status: Wrong number of parameters at startup: @_!\n)
+     unless @_ % 2 == 0;
 
 # Get the parameter hash
 # For all of the methods and values
 #  Die now if invalid method
 #  Call the method with the value
 
-    my ($class,%param) = @_;
-    while (my ($method,$value) = CORE::each( %param )) {
-        die "Cannot call method $method during initialization\n" unless
-	 $method =~ m#^(?:callers|each|encoding|format|output|shorten|signal)$#;
+    my %param = @_;
+    while (my ($method,$value) = each( %param )) {
+        die "Cannot call method $method during initialization\n" unless $method
+	 =~ m#^(?:callers|every|encoding|format|output|shorten|signal)$#;
         $class->$method( $value );
     }
 
-# Start monitoring now if not monitoring yet
+# Start monitoring now if not monitoring yet (show how if from command line)
 
-    start( 0,1 ) unless $monitor_tid;
+    $class->start( (caller())[2] == 0 ) unless $monitor_tid;
 } #import
 
 #---------------------------------------------------------------------------
 
 # internal subroutines
-
-#---------------------------------------------------------------------------
-
-sub _sweep {
-
-# Return now if switched off
-# If we're called to wake up from the main monitoring loop
-#  Reset the wakup flag
-#  And exit the main processing loop in the monitoring thread
-
-    return unless $running;
-    if ($wakeup and threads->tid == $monitor_tid) {
-        $wakeup = 0;
-        die;
-    }
-
-# Attempt to get the lock
-# If another thread is already sweeping
-#  Remember where we are
-#  Increment counter for number of threads swept
-#  Signal the main thread that we're done here
-#  And return (this thread is done and should allow other threads now)
-# Indicate we're sweeping
-# Reset the number of threads swept
-
-    {lock( $sweeping );
-     if ($sweeping) {
-         _remember( 2 );
-         $swept++;
-         {no warnings 'threads'; threads::shared::cond_signal( $swept )};
-	 return;
-     }
-     $sweeping = 1;
-     $swept = 0
-    } #$sweeping
-
-# Initialize local copy of info hash
-# Initialize number of threads swept (already stored info)
-# Make sure we're the only one collecting
-# Signal all of the other threads and remember how many were signalled
-# Wait for all to have reported in
-
-    my %stuff;
-    {lock( $swept );
-     my %waiting = %info;
-     $swept = keys %waiting;
-     my $tids = Thread::Signal->signal( $signal,-2 );
-     threads::shared::cond_wait( $swept ) until $swept == $tids;
-
-# Create local copy of the shared hash with info
-# Reset the shared hash (we don't want to have any info oozing through)
-# Mark that we're done sweeping
-
-     %stuff = %info;
-     %info = %waiting;
-     $sweeping = 0;
-    } #$swept
-
-# If a specific dump is requested
-#  Make sure we're the only ones now
-#  Freeze our stuff in the dump area
-#  And signal that we're ready
-# Else (just need to report)
-#  Perform basic, normal reporting
-
-    if ($dump == 1) {
-        lock( $dump );
-        $dump = join( "\0",map {"$_\n$stuff{$_}"} keys %stuff );
-        threads::shared::cond_signal( $dump );
-    } else {
-        _report( \%stuff );
-    }
-
-# Exit now if the signal used indicates we need to quit
-
-    exit() if $signal eq 'INT';
-} #_sweep
 
 #---------------------------------------------------------------------------
 
@@ -535,7 +522,7 @@ sub _report {
 
     my $stuff = shift;
     my $handle = _handle( $output );
-    return print {_handle( $output )} _raw( $stuff ) if $format eq 'raw';
+    return print {$handle} _raw( $stuff ) if $format eq 'raw';
 
 # For all of the threads
 #  Split the info of a thread
@@ -591,21 +578,39 @@ sub _raw {
 
 sub _plain {
 
+# Obtain the reference to the hash
+# Initialize report to be generated
+
     my $stuff = shift;
     my $report = '';
+
+# For all of the threads of which we have information
+#  Initialize the offset
+#  Save the thread id that we last handled
+
     foreach my $tid (sort {$a <=> $b} keys %$stuff) {
-	my $offset = '';
-	my $lasttid = $tid;
+        my $offset = '';
+        my $lasttid = $tid;
+
+#  For all of the lines of caller information
+#   If the info is from another thread
+#    Save the thread id
+#    Make sure following lines are moved to the right
+#   Obtain the subroutine info
+#   Reset info if it is in an eval
+#   Add the info for this caller info
+#  Add an extra seperator for the next originating thread
+
         foreach my $line (@{$stuff->{$tid}}) {
             if ($line->[0] != $lasttid) {
                 $lasttid = $line->[0];
                 $offset .= '  '
             }
-	    my $sub = $line->[4];
-	    $sub = $sub eq '(eval)' ? '' : "$sub in ";
+            my $sub = $line->[4];
+            $sub = $sub eq '(eval)' ? '' : "$sub in ";
             $report .= "$offset$line->[0]: line $line->[3] in $line->[2] ($sub$line->[1])\n";
         }
-	$report .= "\n";
+        $report .= "\n";
     }
 
 # Return final report
@@ -670,7 +675,7 @@ Thread::Status - report stack status of all running threads
   use Thread::Status;           # start monitoring using default settings
 
   use Thread::Status
-   each    => 1,                # defaults to every 5 seconds
+   every   => 1,                # defaults to every 5 seconds
    callers => 4,                # defaults to 0
    shorten => 0,                # defaults to 1
    format  => 'xml',	        # defaults to 'plain'
@@ -680,9 +685,9 @@ Thread::Status - report stack status of all running threads
 
   use Thread::Status ();                # don't start anything yet
 
-  Thread::Status->each( 1 );            # every second
-  Thread::Status->each( 0 );            # disable, must signal manually
-  $each = Thread::Status->each;
+  Thread::Status->every( 1 );           # every second
+  Thread::Status->every( 0 );           # disable, must signal manually
+  $every = Thread::Status->every;
 
   Thread::Status->callers( 0 );         # default, show no caller lines
   Thread::Status->callers( 4 );         # show 4 caller lines
@@ -750,19 +755,38 @@ then
 
 will report the status of all the thread every 5 seconds on STDERR.
 
+If you would like to have e.g. the output appear in a file with e.g. two levels
+of caller information, you can specify the parameters on the command line as
+well:
+
+ perl -MThread::Status=output,filename,callers,2 yourprogram parameters
+
+A typical output would be:
+
+ 0: line 19 in test1 (main)
+ 0: line 23 in test1 (main::run_the_threads in main)
+
+ 2: line 15 in test1 (main)
+   0: line 17 in test1 (threads::new in main)
+   0: line 23 in test1 (main::run_the_threads in main)
+
+ 3: line 11 in test1 (main)
+   2: line 13 in test1 (threads::new in main)
+     0: line 17 in test1 (threads::new in main)
+
 =head1 CLASS METHODS
 
 These are the class methods.
 
-=head2 each
+=head2 every
 
- Thread::Status->each( 5 );          # default, create every 5 seconds
- 
- Thread::Status->each( 0 );          # do not create reports automatically
+ Thread::Status->every( 5 );         # default, report every 5 seconds
 
- $each = Thread::Status->each;
+ Thread::Status->every( 0 );         # do not create reports automatically
 
-The "each" class method sets and returns the number of seconds that will pass
+ $every = Thread::Status->every;
+
+The "every" class method sets and returns the number of seconds that will pass
 before the next report is automatically generated.  By default a report will
 be created every B<5> seconds.  The value B<0> can be used to indicate that
 no automatic reports should be generated.
@@ -837,6 +861,71 @@ By default the B<HUP> signal will be used.
 Please note that the signal can B<only> be changed if monitoring has not yet
 started.
 
+=head2 start
+
+ Thread::Status->start;
+
+The "start" class method starts the thread that will perform the status
+monitoring.  It can only be called once (or again after method L<stop> was
+called).  Reports will be generated automatically depending on values
+previously set with methods L<every>, L<callers>, L<shorten>, L<output>,
+L<format> and L<encoding>.
+
+=head2 report
+
+ Thread::Status->report;
+
+ $report = Thread::Status->report;
+
+The "report" class method can be called in two ways:
+
+=over 2
+
+=item in void context
+
+Generates a status report depending on values previously set with methods
+L<every>, L<callers>, L<shorten>, L<output>, L<format> and L<encoding>.
+
+=item in scalar context
+
+Creates a data-structure of the status of all of the threads and returns a
+reference to it.  The data-structure has the following format:
+
+ - hash, keyed to thread id, filled with
+ -  a reference to a list for each of the callers, in which element is
+ -   a reference to a list with thread id and all of the fields of caller()
+
+so that:
+
+ foreach my $tid (sort {$a <=> $b} keys %{$report}) {
+   print "Thread $tid:\n";
+   my $level = 0;
+   foreach my $level (@{$report->{$tid}}) {
+     print "  Level $level: $level->[2], line $level->[3]\n";
+   }
+ }
+
+will give you an overview of the status.
+
+=head2 stop
+
+The "stop" class method stops the thread that performs the status monitoring.
+It can only be called after method L<start> has been called.
+
+=head2 monitor_tid
+
+ $tid = Thread::Status->monitor_tid;
+
+The "monitor_tid" class method returns the thread id of the thread that
+performs the status monitoring.
+
+=head2 monitor_pid
+
+ $pid = Thread::Status->monitor_pid;
+
+The "monitor_pid" class method returns the process id of the thread that
+performs the status monitoring.
+
 =head1 OPTIMIZATIONS
 
 This module uses L<AutoLoader> to reduce memory and CPU usage. This causes
@@ -869,9 +958,3 @@ modify it under the same terms as Perl itself.
 L<AutoLoader>, L<Thread::Signal>.
 
 =cut
-
-#---------------------------------------------------------------------------
-
-# AutoLoader takes over from here
-
-__END__

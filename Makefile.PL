@@ -9,6 +9,6 @@ WriteMakefile (
   ABSTRACT	=> 'report stack status of all running threads') : (),
  VERSION_FROM	=> 'lib/Thread/Status.pm',
  PREREQ_PM	=> {
-		    Thread::Signal => '1.04',
+		    Thread::Signal => '1.05',
                    },
 );
